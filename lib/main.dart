@@ -6,6 +6,18 @@ void main() {
   runApp(const TollgateApp());
 }
 
+// --- CONFIGURATION ---
+class EngineConfig {
+  static const double maxAcceptablePrice = 0.20;
+  static const double maxAcceptableLatencyMs = 200.0;
+  
+  static const double priceWeight = 0.40;
+  static const double latencyWeight = 0.30;
+  static const double reliabilityWeight = 0.30;
+  
+  static const double budgetOverageMargin = 2.00;
+}
+
 class TollgateApp extends StatelessWidget {
   const TollgateApp({super.key});
 
@@ -47,15 +59,30 @@ class DemoState extends ChangeNotifier {
   final List<String> steps = ['Search', 'Extract', 'Translate', 'Rank', 'Deliver'];
   List<String> stepStatuses = ['Queued', 'Queued', 'Queued', 'Queued', 'Queued'];
   
+  // Treasury & Execution State
   double totalBudget = 10.00;
   double spent = 0.00;
   double reserved = 0.00;
+  double currentStepCost = 0.0;
+  double totalOverageApproved = 0.0;
   
+  int totalExecutionAttempts = 0;
+  int successfulExecutions = 0;
   int duplicatesBlocked = 0;
-  int activeProviders = 3;
-  double successRate = 100.0;
   
-  // Added Reliability metric for the algorithmic scoring
+  // Deterministic Event Sequencing
+  int eventSequence = 0;
+  
+  String nextEventId(String prefix) {
+    eventSequence++;
+    return '$prefix-${eventSequence.toString().padLeft(6, '0')}';
+  }
+
+  // Idempotency State
+  Set<String> processedIdempotencyKeys = {};
+  String currentIdempotencyKey = "";
+  
+  // Explicit Simulated Provider Profiles
   List<Map<String, dynamic>> providers = [
     {'name': 'Provider A', 'status': 'Online', 'price': 0.12, 'latency': 120, 'reliability': 0.99},
     {'name': 'Provider B', 'status': 'Online', 'price': 0.10, 'latency': 140, 'reliability': 0.95},
@@ -75,6 +102,28 @@ class DemoState extends ChangeNotifier {
   
   int paymentNodeIndex = -1;
   bool forceBudgetOverage = false;
+
+  // --- DERIVED METRICS ---
+  
+  String get successRateStr {
+    if (totalExecutionAttempts == 0) return "100%";
+    return "${((successfulExecutions / totalExecutionAttempts) * 100).toStringAsFixed(1)}%";
+  }
+
+  String get budgetAdherenceStr {
+    if (totalOverageApproved <= 0) return "100%";
+    double adherence = max(0.0, 100.0 - ((totalOverageApproved / totalBudget) * 100));
+    return "${adherence.toStringAsFixed(1)}%";
+  }
+  
+  String get activeProvidersStr {
+    int activeCount = providers.where((p) => p['status'] == 'Online').length;
+    return "$activeCount/${providers.length}";
+  }
+
+  double get availableBalance => totalBudget - spent - reserved;
+  
+  int get failedOrNoChargeExecutions => totalExecutionAttempts - successfulExecutions - duplicatesBlocked;
 
   void logEvent(String message) {
     final time = DateTime.now().toIso8601String().substring(11, 19);
@@ -107,6 +156,8 @@ class DemoState extends ChangeNotifier {
       'Budget Guardrail': 'PENDING',
       'Trust & Identity': 'PENDING',
     };
+    
+    currentIdempotencyKey = nextEventId("IDEM");
     notifyListeners();
     await Future.delayed(const Duration(milliseconds: 600));
 
@@ -126,30 +177,28 @@ class DemoState extends ChangeNotifier {
     
     // --- MULTI-FACTOR ROUTING ALGORITHM ---
     for (var p in available) {
-      // Normalize values (0 to 1 scale)
-      // Assuming max acceptable price is $0.20 and max latency is 200ms
-      double priceScore = max(0, 1.0 - (p['price'] / 0.20)); 
-      double latencyScore = max(0, 1.0 - (p['latency'] / 200.0));
+      double priceScore = max(0, 1.0 - (p['price'] / EngineConfig.maxAcceptablePrice)); 
+      double latencyScore = max(0, 1.0 - (p['latency'] / EngineConfig.maxAcceptableLatencyMs));
       double relScore = p['reliability'];
 
-      // Weights: 40% Price, 30% Latency, 30% Reliability
-      double totalScore = (priceScore * 40) + (latencyScore * 30) + (relScore * 30);
+      double totalScore = (priceScore * EngineConfig.priceWeight) + 
+                          (latencyScore * EngineConfig.latencyWeight) + 
+                          (relScore * EngineConfig.reliabilityWeight);
       
       lastScores.add({
         'name': p['name'],
         'price': p['price'],
         'latency': p['latency'],
-        'score': totalScore,
+        'rawPriceScore': priceScore * 100,
+        'rawLatencyScore': latencyScore * 100,
+        'rawRelScore': relScore * 100,
+        'score': totalScore * 100,
       });
     }
 
-    // Sort by highest score deterministically
     lastScores.sort((a, b) => b['score'].compareTo(a['score']));
-    
-    // Map back to original provider object
     currentWinner = available.firstWhere((p) => p['name'] == lastScores.first['name']);
     
-    // Generate algorithmic reasoning for UI
     String reason = "Highest composite score (${lastScores.first['score'].toStringAsFixed(1)}/100). ";
     double minPrice = available.map((p) => p['price'] as double).reduce(min);
     if (lastScores.first['price'] == minPrice) reason += "Lowest cost. ";
@@ -164,9 +213,10 @@ class DemoState extends ChangeNotifier {
 
     // Policy Gate 2 & 3: Budget and Trust
     policyStatus['Trust & Identity'] = 'PASS';
-    double cost = forceBudgetOverage ? 12.00 : currentWinner!['price'];
     
-    if (spent + reserved + cost > totalBudget) {
+    currentStepCost = forceBudgetOverage ? (availableBalance + EngineConfig.budgetOverageMargin) : currentWinner!['price'];
+    
+    if (spent + reserved + currentStepCost > totalBudget) {
       policyStatus['Budget Guardrail'] = 'WARN (EXCEEDED)';
       stepStatuses[currentStepIndex] = 'Awaiting Approval';
       notifyListeners();
@@ -177,15 +227,41 @@ class DemoState extends ChangeNotifier {
     notifyListeners();
     await Future.delayed(const Duration(milliseconds: 400));
 
-    _executePayment(cost);
+    _executePaymentSequence();
   }
 
-  void _executePayment(double cost) async {
-    reserved += cost;
-    logEvent("Budget reserved: \$${cost.toStringAsFixed(2)}");
+  void _executePaymentSequence() async {
+    // CAPTURE SYNCHRONOUS STATE BEFORE AWAITS TO PREVENT NULL ERRORS MID-FLIGHT
+    final String activeProviderName = currentWinner?['name'] ?? 'Unknown';
+    final int activeStepIndex = currentStepIndex;
+    final String activeIdemKey = currentIdempotencyKey;
+    
+    // 1. Exact Idempotency Check
+    totalExecutionAttempts++;
+    if (processedIdempotencyKeys.contains(activeIdemKey)) {
+      duplicatesBlocked++;
+      ledger.insert(0, {
+        'time': DateTime.now().toIso8601String().substring(11, 19),
+        'step': steps[activeStepIndex],
+        'provider': activeProviderName,
+        'amount': 0.0,
+        'status': 'Blocked – Duplicate',
+        'eventId': nextEventId('BLK'),
+        'idempotencyKey': activeIdemKey
+      });
+      logEvent("Duplicate request blocked (idempotency key reused).");
+      notifyListeners();
+      return; 
+    }
+
+    processedIdempotencyKeys.add(activeIdemKey);
+    
+    // 2. Exact Reservation Logic
+    reserved += currentStepCost;
+    logEvent("Budget reserved: \$${currentStepCost.toStringAsFixed(2)}");
     notifyListeners();
     
-    // Animate Payment Nodes
+    // 3. Payment Protocol Visualizer Simulation
     for (int i = 0; i < 5; i++) {
       paymentNodeIndex = i;
       notifyListeners();
@@ -193,21 +269,25 @@ class DemoState extends ChangeNotifier {
     }
     paymentNodeIndex = -1;
 
-    // Settlement
-    reserved -= cost;
-    spent += cost;
+    // 4. Exact Settlement Logic
+    if (currentStepCost == 0.0) return; 
+
+    reserved -= currentStepCost;
+    spent += currentStepCost;
+    successfulExecutions++;
     
     ledger.insert(0, {
       'time': DateTime.now().toIso8601String().substring(11, 19),
-      'step': steps[currentStepIndex],
-      'provider': currentWinner!['name'],
-      'amount': cost,
+      'step': steps[activeStepIndex],
+      'provider': activeProviderName,
+      'amount': currentStepCost,
       'status': 'Settled',
-      'hash': '0x${Random().nextInt(999999).toRadixString(16)}'
+      'eventId': nextEventId('TX'),
+      'idempotencyKey': activeIdemKey
     });
     
-    stepStatuses[currentStepIndex] = 'Complete';
-    logEvent("Settlement confirmed for ${steps[currentStepIndex]}");
+    stepStatuses[activeStepIndex] = 'Complete';
+    logEvent("Settlement confirmed for ${steps[activeStepIndex]}");
     currentStepIndex++;
     notifyListeners();
     
@@ -220,12 +300,16 @@ class DemoState extends ChangeNotifier {
   void resolveApproval(bool approved) {
     forceBudgetOverage = false;
     if (approved) {
+      double overage = (spent + reserved + currentStepCost) - totalBudget;
+      if (overage > 0) totalOverageApproved += overage;
+      
       logEvent("Manual override approved. Policy forced to PASS.");
       policyStatus['Budget Guardrail'] = 'PASS (OVERRIDE)';
       notifyListeners();
-      _executePayment(12.00); 
+      _executePaymentSequence(); 
     } else {
       logEvent("Manual override denied. Step skipped.");
+      currentStepCost = 0.0; 
       stepStatuses[currentStepIndex] = 'Skipped';
       currentStepIndex++;
       _processStep();
@@ -235,26 +319,15 @@ class DemoState extends ChangeNotifier {
   void fireDuplicatePayment(BuildContext context) {
     if (!isRunning || currentStepIndex >= steps.length) return;
     
-    duplicatesBlocked++;
-    ledger.insert(0, {
-      'time': DateTime.now().toIso8601String().substring(11, 19),
-      'step': steps[currentStepIndex],
-      'provider': currentWinner?['name'] ?? 'Unknown',
-      'amount': currentWinner?['price'] ?? 0.0,
-      'status': 'Blocked – Duplicate',
-      'hash': '0xDUP${Random().nextInt(9999).toRadixString(16)}'
-    });
+    _executePaymentSequence();
     
-    logEvent("Duplicate request blocked (idempotency key reused).");
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Duplicate request detected — blocked.', style: TextStyle(color: Colors.white)), backgroundColor: Colors.black),
+      const SnackBar(content: Text('Simulated duplicate payload fired.', style: TextStyle(color: Colors.white)), backgroundColor: Colors.black),
     );
-    notifyListeners();
   }
 
   void killProvider(int index, BuildContext context) {
     providers[index]['status'] = 'Offline';
-    activeProviders--;
     logEvent("${providers[index]['name']} failure detected.");
     
     if (isRunning && currentWinner != null && currentWinner!['name'] == providers[index]['name']) {
@@ -281,10 +354,15 @@ class DemoState extends ChangeNotifier {
           'provider': providers[index]['name'],
           'amount': 0.0,
           'status': 'Failed – No Charge',
-          'hash': '0xERR'
+          'eventId': nextEventId('ERR'),
+          'idempotencyKey': currentIdempotencyKey
        });
        
-       reserved = 0; 
+       reserved -= currentStepCost;
+       if (reserved < 0) reserved = 0.0; 
+       currentStepCost = 0.0; 
+       totalExecutionAttempts++;
+       
        _processStep(); 
     }
     notifyListeners();
@@ -302,11 +380,19 @@ class DemoState extends ChangeNotifier {
     
     for (var entry in oldLedger.reversed) {
       ledger.insert(0, entry);
-      spent += entry['amount'];
+      
+      if (entry['status'] == 'Settled') {
+        spent += entry['amount'];
+        successfulExecutions++;
+      } else if (entry['status'] == 'Blocked – Duplicate') {
+        duplicatesBlocked++;
+      }
+      totalExecutionAttempts++;
+      
       notifyListeners();
       await Future.delayed(const Duration(milliseconds: 200));
     }
-    logEvent("Replay complete — all events matched original hashes.");
+    logEvent("Replay complete — ledger events reconstructed successfully.");
     isReplaying = false;
   }
 
@@ -316,15 +402,26 @@ class DemoState extends ChangeNotifier {
     summaryShown = false; 
     currentStepIndex = -1;
     stepStatuses = ['Queued', 'Queued', 'Queued', 'Queued', 'Queued'];
+    
     spent = 0.0;
     reserved = 0.0;
+    currentStepCost = 0.0;
+    totalOverageApproved = 0.0;
+    
+    totalExecutionAttempts = 0;
+    successfulExecutions = 0;
     duplicatesBlocked = 0;
-    activeProviders = 3;
+    eventSequence = 0;
+    
+    processedIdempotencyKeys.clear();
+    currentIdempotencyKey = "";
+    
     providers = [
       {'name': 'Provider A', 'status': 'Online', 'price': 0.12, 'latency': 120, 'reliability': 0.99},
       {'name': 'Provider B', 'status': 'Online', 'price': 0.10, 'latency': 140, 'reliability': 0.95},
       {'name': 'Provider C', 'status': 'Online', 'price': 0.15, 'latency': 90,  'reliability': 0.999},
     ];
+    
     ledger.clear();
     auditLog = ['System initialized.'];
     currentWinner = null;
@@ -357,7 +454,6 @@ class _TollgateDashboardState extends State<TollgateDashboard> {
       listenable: state,
       builder: (context, _) {
         
-        // Handle Dialog Trigger
         if (state.isRunning && state.currentStepIndex >= 0 && state.currentStepIndex < state.stepStatuses.length) {
            if (state.stepStatuses[state.currentStepIndex] == 'Awaiting Approval') {
              WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -368,7 +464,6 @@ class _TollgateDashboardState extends State<TollgateDashboard> {
            }
         }
 
-        // Handle Summary Card Trigger
         if (!state.isRunning && state.currentStepIndex >= state.steps.length && !state.summaryShown) {
             WidgetsBinding.instance.addPostFrameCallback((_) {
                if (ModalRoute.of(context)?.isCurrent == true) {
@@ -412,10 +507,10 @@ class _TollgateDashboardState extends State<TollgateDashboard> {
                 child: Row(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    // Left Column (Metrics, Task, Visuals)
+                    // Left Column - SCROLLABLE WRAPPER TO PREVENT OVERFLOW
                     Expanded(
                       flex: 5,
-                      child: Padding(
+                      child: SingleChildScrollView(
                         padding: const EdgeInsets.all(32.0),
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
@@ -425,15 +520,14 @@ class _TollgateDashboardState extends State<TollgateDashboard> {
                             _buildActiveTaskPanel(),
                             const SizedBox(height: 48),
                             _buildLivePaymentVisualizer(),
-                            const Spacer(),
+                            const SizedBox(height: 48),
                             _buildProviderGrid(context),
                           ],
                         ),
                       ),
                     ),
-                    // Vertical Divider
                     Container(width: 1, color: const Color(0xFFEEEEEE)),
-                    // Right Column (Decision Engine, Treasury, Ledger, Audit)
+                    // Right Column - FLEXIBLE WRAPPERS ADDED
                     Expanded(
                       flex: 4,
                       child: Padding(
@@ -443,12 +537,18 @@ class _TollgateDashboardState extends State<TollgateDashboard> {
                           children: [
                             _buildTreasuryMeter(),
                             const SizedBox(height: 24),
-                            // Replaced old route panel with the new Decision Engine Panel
-                            if (state.currentWinner != null || state.isRunning) _buildDecisionEnginePanel(),
-                            const SizedBox(height: 24),
-                            Expanded(child: _buildLedger()),
+                            if (state.currentWinner != null || state.isRunning) 
+                              Flexible(
+                                flex: 3, 
+                                child: SingleChildScrollView(
+                                  child: _buildDecisionEnginePanel()
+                                )
+                              ),
+                            if (state.currentWinner != null || state.isRunning)
+                              const SizedBox(height: 24),
+                            Expanded(flex: 2, child: _buildLedger()),
                             const SizedBox(height: 16),
-                            Expanded(child: _buildAuditTimeline()),
+                            Expanded(flex: 2, child: _buildAuditTimeline()),
                           ],
                         ),
                       ),
@@ -506,9 +606,9 @@ class _TollgateDashboardState extends State<TollgateDashboard> {
       children: [
         _kpiTile("Total Spend", "\$${state.spent.toStringAsFixed(2)}"),
         _kpiTile("Duplicates Blocked", "${state.duplicatesBlocked}"),
-        _kpiTile("Success Rate", "${state.successRate}%"),
-        _kpiTile("Budget Adherence", "100%"),
-        _kpiTile("Active Providers", "${state.activeProviders}/3"),
+        _kpiTile("Success Rate", state.successRateStr),
+        _kpiTile("Budget Adherence", state.budgetAdherenceStr),
+        _kpiTile("Active Providers", state.activeProvidersStr),
       ],
     );
   }
@@ -552,10 +652,7 @@ class _TollgateDashboardState extends State<TollgateDashboard> {
                         duration: const Duration(milliseconds: 300),
                         width: isActive ? 24 : 16,
                         height: isActive ? 24 : 16,
-                        decoration: BoxDecoration(
-                          color: nodeColor,
-                          shape: BoxShape.circle,
-                        ),
+                        decoration: BoxDecoration(color: nodeColor, shape: BoxShape.circle),
                       ),
                       const SizedBox(height: 12),
                       Text(state.steps[index], style: TextStyle(fontSize: 12, fontWeight: isActive ? FontWeight.bold : FontWeight.normal)),
@@ -573,7 +670,19 @@ class _TollgateDashboardState extends State<TollgateDashboard> {
     );
   }
 
-  // --- NEW DECISION ENGINE PANEL ---
+  Widget _statRow(String label, double rawScore) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4.0),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(label, style: const TextStyle(fontSize: 11, color: Colors.black54)),
+          Text(rawScore.toStringAsFixed(1), style: const TextStyle(fontSize: 11, fontFamily: 'monospace', fontWeight: FontWeight.bold)),
+        ],
+      ),
+    );
+  }
+
   Widget _buildDecisionEnginePanel() {
     return Card(
       child: Padding(
@@ -584,7 +693,6 @@ class _TollgateDashboardState extends State<TollgateDashboard> {
             const Text("POLICY EVALUATION & ROUTING", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, letterSpacing: 1.5, color: Colors.grey)),
             const SizedBox(height: 16),
             
-            // 1. Policy Gates
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: state.policyStatus.entries.map((entry) {
@@ -610,7 +718,56 @@ class _TollgateDashboardState extends State<TollgateDashboard> {
                 padding: EdgeInsets.symmetric(vertical: 16.0),
                 child: Divider(height: 1, color: Color(0xFFEEEEEE)),
               ),
-              // 2. Algorithmic Routing Scores
+              
+              const Text("EXPLICIT ROUTING MATHEMATICS", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, letterSpacing: 1.5, color: Colors.grey)),
+              const SizedBox(height: 12),
+              
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(color: Colors.blue[50], borderRadius: BorderRadius.circular(4)),
+                child: Text(
+                  "Score = ${(EngineConfig.priceWeight).toStringAsFixed(2)}×PriceScore + ${(EngineConfig.latencyWeight).toStringAsFixed(2)}×LatencyScore + ${(EngineConfig.reliabilityWeight).toStringAsFixed(2)}×RelScore\n"
+                  "PriceScore = max(0, 1 - price / ${EngineConfig.maxAcceptablePrice})\n"
+                  "LatencyScore = max(0, 1 - latency / ${EngineConfig.maxAcceptableLatencyMs})",
+                  style: const TextStyle(fontSize: 10, color: Colors.blue, fontFamily: 'monospace', fontWeight: FontWeight.bold),
+                ),
+              ),
+              const SizedBox(height: 12),
+
+              if (state.currentWinner != null) ...state.lastScores.where((s) => s['name'] == state.currentWinner!['name']).map((winnerScore) {
+                return Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Colors.white, 
+                    border: Border.all(color: Colors.grey[300]!), 
+                    borderRadius: BorderRadius.circular(4)
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                       Text("Winner Breakdown: ${winnerScore['name']}", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                       const SizedBox(height: 8),
+                       _statRow("Price Score (${(EngineConfig.priceWeight * 100).toStringAsFixed(0)}%)", winnerScore['rawPriceScore']),
+                       _statRow("Latency Score (${(EngineConfig.latencyWeight * 100).toStringAsFixed(0)}%)", winnerScore['rawLatencyScore']),
+                       _statRow("Reliability Score (${(EngineConfig.reliabilityWeight * 100).toStringAsFixed(0)}%)", winnerScore['rawRelScore']),
+                       const Divider(height: 16),
+                       Row(
+                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                         children: [
+                           const Text("Weighted Total", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                           Text(winnerScore['score'].toStringAsFixed(1), style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: Colors.green)),
+                         ]
+                       )
+                    ]
+                  )
+                );
+              }),
+              
+              const SizedBox(height: 16),
+              
+              const Text("CANDIDATE RANKING", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, letterSpacing: 1.5, color: Colors.grey)),
+              const SizedBox(height: 8),
               Column(
                 children: state.lastScores.map((scoreCard) {
                   bool isWinner = state.currentWinner != null && state.currentWinner!['name'] == scoreCard['name'];
@@ -621,29 +778,12 @@ class _TollgateDashboardState extends State<TollgateDashboard> {
                       children: [
                         Text(scoreCard['name'], style: TextStyle(fontWeight: isWinner ? FontWeight.bold : FontWeight.normal)),
                         Text("\$${scoreCard['price']} | ${scoreCard['latency']}ms", style: const TextStyle(color: Colors.grey, fontSize: 12)),
-                        Text("Score: ${scoreCard['score'].toStringAsFixed(1)}", style: TextStyle(fontWeight: isWinner ? FontWeight.bold : FontWeight.normal, color: isWinner ? Colors.black : Colors.grey)),
+                        Text(scoreCard['score'].toStringAsFixed(1), style: TextStyle(fontWeight: isWinner ? FontWeight.bold : FontWeight.normal, color: isWinner ? Colors.green : Colors.grey)),
                       ],
                     ),
                   );
                 }).toList(),
               ),
-              
-              const SizedBox(height: 12),
-              
-              // 3. Decision Explanation
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(color: Colors.green[50], borderRadius: BorderRadius.circular(4)),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text("Selected: ${state.currentWinner!['name']}", style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.green)),
-                    const SizedBox(height: 4),
-                    Text("Reason: ${state.currentWinner!['reason']}", style: TextStyle(fontSize: 12, color: Colors.green[800])),
-                  ],
-                ),
-              )
             ]
           ],
         ),
@@ -662,7 +802,7 @@ class _TollgateDashboardState extends State<TollgateDashboard> {
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
             const Text("TREASURY & BUDGET", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, letterSpacing: 1.5, color: Colors.grey)),
-            Text("Available: \$${(state.totalBudget - state.spent - state.reserved).toStringAsFixed(2)}", style: const TextStyle(fontSize: 12)),
+            Text("Available: \$${state.availableBalance.toStringAsFixed(2)}", style: const TextStyle(fontSize: 12)),
           ],
         ),
         const SizedBox(height: 12),
@@ -687,7 +827,7 @@ class _TollgateDashboardState extends State<TollgateDashboard> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-         const Text("PROTOCOL VISUALIZER", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, letterSpacing: 1.5, color: Colors.grey)),
+         const Text("x402 PAYMENT LIFECYCLE (SIMULATED)", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, letterSpacing: 1.5, color: Colors.grey)),
          const SizedBox(height: 24),
          Row(
            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
@@ -716,31 +856,41 @@ class _TollgateDashboardState extends State<TollgateDashboard> {
   }
 
   Widget _buildProviderGrid(BuildContext context) {
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-      children: List.generate(state.providers.length, (index) {
-        var p = state.providers[index];
-        bool isOnline = p['status'] == 'Online';
-        return Card(
-          child: Padding(
-            padding: const EdgeInsets.all(16.0),
-            child: Column(
-              children: [
-                Text(p['name'], style: const TextStyle(fontWeight: FontWeight.bold)),
-                const SizedBox(height: 8),
-                Switch(
-                  value: isOnline,
-                  activeColor: Colors.black,
-                  onChanged: (val) {
-                    if (!val) state.killProvider(index, context);
-                  },
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text("DYNAMIC PROVIDER PROFILES (SIMULATED)", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, letterSpacing: 1.5, color: Colors.grey)),
+        const SizedBox(height: 16),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+          children: List.generate(state.providers.length, (index) {
+            var p = state.providers[index];
+            bool isOnline = p['status'] == 'Online';
+            return Expanded(
+              child: Card(
+                margin: EdgeInsets.only(right: index == state.providers.length - 1 ? 0 : 12),
+                child: Padding(
+                  padding: const EdgeInsets.all(16.0),
+                  child: Column(
+                    children: [
+                      Text(p['name'], style: const TextStyle(fontWeight: FontWeight.bold)),
+                      const SizedBox(height: 8),
+                      Switch(
+                        value: isOnline,
+                        activeColor: Colors.black,
+                        onChanged: (val) {
+                          if (!val) state.killProvider(index, context);
+                        },
+                      ),
+                      Text(p['status'], style: TextStyle(color: isOnline ? Colors.green : Colors.red, fontSize: 12)),
+                    ],
+                  ),
                 ),
-                Text(p['status'], style: TextStyle(color: isOnline ? Colors.green : Colors.red, fontSize: 12)),
-              ],
-            ),
-          ),
-        );
-      }),
+              ),
+            );
+          }),
+        ),
+      ],
     );
   }
 
@@ -764,6 +914,7 @@ class _TollgateDashboardState extends State<TollgateDashboard> {
                     Expanded(child: Text(row['step'], style: const TextStyle(fontSize: 12))),
                     Expanded(child: Text(row['provider'], style: const TextStyle(fontSize: 12))),
                     Expanded(child: Text("\$${row['amount'].toStringAsFixed(2)}", style: const TextStyle(fontSize: 12))),
+                    Expanded(flex: 2, child: Text(row['eventId'] ?? "", style: const TextStyle(fontSize: 11, fontFamily: 'monospace', color: Colors.black54))),
                     Expanded(flex: 2, child: Text(row['status'], style: TextStyle(fontSize: 12, color: row['status'].contains('Blocked') || row['status'].contains('Failed') ? Colors.red : Colors.green))),
                   ],
                 ),
@@ -806,7 +957,7 @@ class _TollgateDashboardState extends State<TollgateDashboard> {
       barrierDismissible: false,
       builder: (context) => AlertDialog(
         title: const Text("Budget Cap Exceeded", style: TextStyle(fontWeight: FontWeight.bold)),
-        content: const Text("The requested reservation exceeds the available budget. Do you want to manually approve this overage?"),
+        content: Text("The requested cost (\$${state.currentStepCost.toStringAsFixed(2)}) exceeds the available budget limit. Do you want to manually approve this overage?"),
         actions: [
           TextButton(
             onPressed: () {
@@ -838,8 +989,11 @@ class _TollgateDashboardState extends State<TollgateDashboard> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text("Total Cost: \$${state.spent.toStringAsFixed(2)}"),
+            Text("Successful Executions: ${state.successfulExecutions}"),
+            Text("Failed / No-Charge: ${state.failedOrNoChargeExecutions}"),
             Text("Duplicates Blocked: ${state.duplicatesBlocked}"),
-            const Text("Budget Adherence: 100%"),
+            Text("Total Routing Attempts: ${state.totalExecutionAttempts}"),
+            Text("Budget Adherence: ${state.budgetAdherenceStr}"),
           ],
         ),
         actions: [
